@@ -27,6 +27,7 @@ jobs:
         uses: pullfrog/action@v0
         with:
           prompt: ${{ github.event.inputs.prompt }}
+        env:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           cursor_api_key: ${{ secrets.CURSOR_API_KEY }}
           openai_api_key: ${{ secrets.OPENAI_API_KEY }}
