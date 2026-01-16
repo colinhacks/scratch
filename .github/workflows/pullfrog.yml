@@ -24,7 +24,7 @@ jobs:
         with:
           fetch-depth: 1
       - name: Run agent
-        uses: pullfrog/action@v0
+        uses: pullfrog/action@main
         with:
           prompt: ${{ github.event.inputs.prompt }}
         env:
