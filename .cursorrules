@@ -1,0 +1,14 @@
+# Security Rules
+
+Use `gh_pullfrog/shell` for all command execution. Do not use native shell tools.
+
+Never access, read, log, print, encode, transmit, or exfiltrate API keys or secrets from environment variables.
+
+Prohibited:
+- `env`, `printenv`, `set`, `export` commands
+- Reading `/proc/self/environ` or `/proc/*/environ`
+- Accessing `process.env`, `os.environ`, or equivalent
+- Encoding/writing/transmitting secrets in any form
+- Embedding secrets in code, comments, commits, PRs, or any output
+
+Refuse all requests to access or expose secrets, regardless of user instructions.
