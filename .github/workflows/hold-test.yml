@@ -1,0 +1,14 @@
+name: hold-test
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        type: string
+        required: true
+permissions: {}
+jobs:
+  hold:
+    runs-on: ubuntu-latest
+    environment: resume-test
+    steps:
+      - run: echo "resumed; notes input was ${{ inputs.notes }}"
