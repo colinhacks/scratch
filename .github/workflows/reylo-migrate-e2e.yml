@@ -236,7 +236,7 @@ jobs:
         run: irm https://reylo.dev/install.ps1 | iex
       - name: "Channel: install.ps1 in PowerShell 7, checked"
         if: ${{ !cancelled() }}
-        run: bash reylo-e2e/smoke.sh install.ps1 "$HOME/.local/bin/reylo.exe"
+        run: env -u CI bash reylo-e2e/smoke.sh install.ps1 "$HOME/.local/bin/reylo.exe"
       - name: "Channel: install.ps1 in Windows PowerShell 5.1"
         if: ${{ !cancelled() }}
         shell: powershell
@@ -246,7 +246,7 @@ jobs:
           irm https://reylo.dev/install.ps1 | iex
       - name: "Channel: install.ps1 in Windows PowerShell 5.1, checked"
         if: ${{ !cancelled() }}
-        run: bash reylo-e2e/smoke.sh install.ps1-5.1 "$RUNNER_TEMP/ps51/reylo.exe"
+        run: env -u CI bash reylo-e2e/smoke.sh install.ps1-5.1 "$RUNNER_TEMP/ps51/reylo.exe"
       - name: "Channel: Scoop"
         if: ${{ !cancelled() }}
         shell: pwsh
@@ -258,7 +258,7 @@ jobs:
           scoop install reylo
       - name: "Channel: Scoop, checked"
         if: ${{ !cancelled() }}
-        run: bash reylo-e2e/smoke.sh scoop "$HOME/scoop/shims/reylo.exe"
+        run: env -u CI bash reylo-e2e/smoke.sh scoop "$HOME/scoop/shims/reylo.exe"
       - name: "Channel: npm install --global"
         if: ${{ !cancelled() }}
         run: |
