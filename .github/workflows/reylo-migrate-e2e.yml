@@ -1,0 +1,286 @@
+# A new user's install of reylo, through each channel reylo.dev documents, and a walk through
+# Reylo Migrate (reylo-e2e/e2e.sh) on SQLite, Postgres and MySQL, on every platform reylo ships for.
+name: reylo-migrate-e2e
+
+on:
+  push:
+    branches: [reylo-migrate-e2e]
+
+permissions:
+  contents: read
+
+env:
+  REYLO_VERSION: 0.8.2
+
+jobs:
+  linux:
+    name: linux ${{ matrix.cpu }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            cpu: x64
+          - runner: ubuntu-24.04-arm
+            cpu: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s --health-retries 30
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+        ports: ["3306:3306"]
+        options: --health-cmd "mysqladmin ping -h 127.0.0.1" --health-interval 2s --health-timeout 5s --health-retries 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: "Channel: curl install.sh"
+        if: ${{ !cancelled() }}
+        run: |
+          curl -fsSL https://reylo.dev/install.sh | sh
+          bash reylo-e2e/smoke.sh curl "$HOME/.local/bin/reylo"
+      - name: "Channel: npm install --global"
+        if: ${{ !cancelled() }}
+        run: |
+          npm install --global "reylo@$REYLO_VERSION"
+          bash reylo-e2e/smoke.sh npm "$(npm prefix --global)/bin/reylo"
+      - name: "Channel: npx"
+        if: ${{ !cancelled() }}
+        run: |
+          printf '#!/bin/sh\nexec npx --yes reylo@%s "$@"\n' "$REYLO_VERSION" > "$RUNNER_TEMP/npx-reylo" && chmod +x "$RUNNER_TEMP/npx-reylo"
+          bash reylo-e2e/smoke.sh npx "$RUNNER_TEMP/npx-reylo"
+      - name: "Channel: Homebrew"
+        if: ${{ !cancelled() && matrix.cpu == 'x64' }}
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew install reylosql/tap/reylo
+          bash reylo-e2e/smoke.sh brew "$(brew --prefix)/bin/reylo"
+      - name: "Channel: mise"
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          curl -fsSL https://mise.run | MISE_INSTALL_PATH="$RUNNER_TEMP/mise" sh
+          mkdir -p "$RUNNER_TEMP/mise-project" && cd "$RUNNER_TEMP/mise-project"
+          printf '[tools]\n"github:reylosql/reylo" = "%s"\n' "$REYLO_VERSION" > mise.toml
+          "$RUNNER_TEMP/mise" trust && "$RUNNER_TEMP/mise" install
+          bash "$GITHUB_WORKSPACE/reylo-e2e/smoke.sh" mise "$("$RUNNER_TEMP/mise" which reylo)"
+      - name: "Channel: Docker image"
+        if: ${{ !cancelled() }}
+        run: |
+          printf '#!/bin/sh\nexec docker run --rm --network host --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work ghcr.io/reylosql/reylo:%s "$@"\n' "$REYLO_VERSION" > "$RUNNER_TEMP/docker-reylo" && chmod +x "$RUNNER_TEMP/docker-reylo"
+          bash reylo-e2e/smoke.sh docker "$RUNNER_TEMP/docker-reylo"
+      - name: "Migrate walk: SQLite"
+        if: ${{ !cancelled() }}
+        env:
+          E2E_NODE: "1"
+        run: PATH="$HOME/.local/bin:$PATH" bash reylo-e2e/e2e.sh sqlite "$RUNNER_TEMP/e2e-sqlite"
+      - name: "Migrate walk: Postgres 18"
+        if: ${{ !cancelled() }}
+        env:
+          E2E_NODE: "1"
+          E2E_SERVER: postgres://postgres@127.0.0.1:5432
+        run: PATH="$HOME/.local/bin:$PATH" bash reylo-e2e/e2e.sh postgres "$RUNNER_TEMP/e2e-postgres"
+      - name: "Migrate walk: MySQL 8.4"
+        if: ${{ !cancelled() }}
+        env:
+          E2E_NODE: "1"
+          E2E_SERVER: mysql://root@127.0.0.1:3306
+        run: PATH="$HOME/.local/bin:$PATH" bash reylo-e2e/e2e.sh mysql "$RUNNER_TEMP/e2e-mysql"
+      - name: "Migrate walk through the Docker image: Postgres 18"
+        if: ${{ !cancelled() }}
+        env:
+          E2E_SERVER: postgres://postgres@127.0.0.1:5432
+        run: |
+          mkdir -p "$RUNNER_TEMP/docker-bin" && cp "$RUNNER_TEMP/docker-reylo" "$RUNNER_TEMP/docker-bin/reylo"
+          PATH="$RUNNER_TEMP/docker-bin:$PATH" bash reylo-e2e/e2e.sh postgres "$RUNNER_TEMP/e2e-docker"
+      # musl: Alpine, with install.sh through busybox wget (the image has no curl).
+      - name: "Alpine (musl): install.sh through wget, npm, and the walk on all three"
+        if: ${{ !cancelled() }}
+        run: |
+          docker run --rm --network host -e REYLO_VERSION -v "$GITHUB_WORKSPACE:/src:ro" node:24-alpine sh -c '
+            set -e
+            apk add --no-cache bash > /dev/null
+            command -v curl && echo "curl is present, so wget is not exercised" || true
+            wget -qO- https://reylo.dev/install.sh | sh
+            bash /src/reylo-e2e/smoke.sh wget-alpine /root/.local/bin/reylo
+            npm install --global "reylo@$REYLO_VERSION" > /dev/null
+            bash /src/reylo-e2e/smoke.sh npm-alpine "$(npm prefix --global)/bin/reylo"
+            export PATH=/root/.local/bin:$PATH E2E_NODE=1
+            status=0
+            bash /src/reylo-e2e/e2e.sh sqlite /tmp/e2e-sqlite || status=1
+            E2E_SERVER=postgres://postgres@127.0.0.1:5432 bash /src/reylo-e2e/e2e.sh postgres /tmp/e2e-postgres || status=1
+            E2E_SERVER=mysql://root@127.0.0.1:3306 bash /src/reylo-e2e/e2e.sh mysql /tmp/e2e-mysql || status=1
+            exit $status
+          '
+      # Older and smaller distributions: install.sh alone.
+      - name: "install.sh on Debian 11, AlmaLinux 8 and Amazon Linux 2023"
+        if: ${{ !cancelled() }}
+        run: |
+          status=0
+          for image in debian:11 almalinux:8 amazonlinux:2023; do
+            echo "== $image"
+            docker run --rm -e REYLO_VERSION -v "$GITHUB_WORKSPACE:/src:ro" "$image" bash -c '
+              set -e
+              if command -v apt-get > /dev/null; then apt-get update -qq > /dev/null && apt-get install -y -qq curl ca-certificates > /dev/null; fi
+              if [ -f /etc/os-release ] && grep -q amzn /etc/os-release; then
+                echo "-- without tar, as the image comes:"
+                curl -fsSL https://reylo.dev/install.sh | sh && echo "UNEXPECTED: installed with no tar" || true
+                dnf install -y -q tar gzip > /dev/null
+              fi
+              curl -fsSL https://reylo.dev/install.sh | sh
+              bash /src/reylo-e2e/smoke.sh "install.sh-$(. /etc/os-release && echo $ID-$VERSION_ID)" /root/.local/bin/reylo
+            ' || status=1
+          done
+          exit $status
+
+  macos:
+    name: macos ${{ matrix.cpu }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            cpu: arm64
+          - runner: macos-15-intel
+            cpu: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: "Channel: curl install.sh"
+        if: ${{ !cancelled() }}
+        run: |
+          curl -fsSL https://reylo.dev/install.sh | sh
+          bash reylo-e2e/smoke.sh curl "$HOME/.local/bin/reylo"
+      - name: "Channel: Homebrew"
+        if: ${{ !cancelled() }}
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install reylosql/tap/reylo
+          bash reylo-e2e/smoke.sh brew "$(brew --prefix)/bin/reylo"
+      - name: "Channel: npm install --global"
+        if: ${{ !cancelled() }}
+        run: |
+          npm install --global "reylo@$REYLO_VERSION"
+          bash reylo-e2e/smoke.sh npm "$(npm prefix --global)/bin/reylo"
+      - name: "Channel: mise"
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          curl -fsSL https://mise.run | MISE_INSTALL_PATH="$RUNNER_TEMP/mise" sh
+          mkdir -p "$RUNNER_TEMP/mise-project" && cd "$RUNNER_TEMP/mise-project"
+          printf '[tools]\n"github:reylosql/reylo" = "%s"\n' "$REYLO_VERSION" > mise.toml
+          "$RUNNER_TEMP/mise" trust && "$RUNNER_TEMP/mise" install
+          bash "$GITHUB_WORKSPACE/reylo-e2e/smoke.sh" mise "$("$RUNNER_TEMP/mise" which reylo)"
+      - name: Start Postgres 18
+        if: ${{ !cancelled() }}
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install postgresql@18 > /dev/null
+          bin="$(brew --prefix postgresql@18)/bin"
+          "$bin/initdb" -D "$RUNNER_TEMP/pg" -U postgres --auth=trust -E UTF8 --locale=C > /dev/null
+          "$bin/pg_ctl" -D "$RUNNER_TEMP/pg" -o "-p 5432 -c listen_addresses=127.0.0.1" -l "$RUNNER_TEMP/pg.log" -w start
+      - name: "Migrate walk: SQLite"
+        if: ${{ !cancelled() }}
+        env:
+          E2E_NODE: "1"
+        run: PATH="$HOME/.local/bin:$PATH" bash reylo-e2e/e2e.sh sqlite "$RUNNER_TEMP/e2e-sqlite"
+      - name: "Migrate walk: Postgres 18"
+        if: ${{ !cancelled() }}
+        env:
+          E2E_NODE: "1"
+          E2E_SERVER: postgres://postgres@127.0.0.1:5432
+        run: PATH="$HOME/.local/bin:$PATH" bash reylo-e2e/e2e.sh postgres "$RUNNER_TEMP/e2e-postgres"
+
+  windows:
+    name: windows ${{ matrix.cpu }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            cpu: x64
+          - runner: windows-11-arm
+            cpu: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: "Channel: install.ps1 in PowerShell 7"
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: irm https://reylo.dev/install.ps1 | iex
+      - name: "Channel: install.ps1 in PowerShell 7, checked"
+        if: ${{ !cancelled() }}
+        run: bash reylo-e2e/smoke.sh install.ps1 "$HOME/.local/bin/reylo.exe"
+      - name: "Channel: install.ps1 in Windows PowerShell 5.1"
+        if: ${{ !cancelled() }}
+        shell: powershell
+        run: |
+          $env:REYLO_INSTALL_DIR = "$env:RUNNER_TEMP\ps51"
+          $env:REYLO_NO_MODIFY_PATH = "1"
+          irm https://reylo.dev/install.ps1 | iex
+      - name: "Channel: install.ps1 in Windows PowerShell 5.1, checked"
+        if: ${{ !cancelled() }}
+        run: bash reylo-e2e/smoke.sh install.ps1-5.1 "$RUNNER_TEMP/ps51/reylo.exe"
+      - name: "Channel: Scoop"
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          irm get.scoop.sh -OutFile "$env:RUNNER_TEMP\scoop.ps1"
+          & "$env:RUNNER_TEMP\scoop.ps1" -RunAsAdmin
+          $env:Path = "$HOME\scoop\shims;$env:Path"
+          scoop bucket add reylo https://github.com/reylosql/scoop-bucket
+          scoop install reylo
+      - name: "Channel: Scoop, checked"
+        if: ${{ !cancelled() }}
+        run: bash reylo-e2e/smoke.sh scoop "$HOME/scoop/shims/reylo.exe"
+      - name: "Channel: npm install --global"
+        if: ${{ !cancelled() }}
+        run: |
+          npm install --global "reylo@$REYLO_VERSION"
+          bash reylo-e2e/smoke.sh npm "$(cygpath -u "$(npm prefix --global)")/reylo"
+      - name: Start Postgres
+        id: pg
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -z "${PGBIN:-}" ] || [ ! -x "$PGBIN/initdb.exe" ]; then echo "no Postgres on this runner"; exit 0; fi
+          "$PGBIN/initdb" -D "$RUNNER_TEMP/pg" -U postgres --auth=trust -E UTF8 --locale=C > /dev/null
+          "$PGBIN/pg_ctl" -D "$RUNNER_TEMP/pg" -o "-p 25432 -c listen_addresses=127.0.0.1" -l "$RUNNER_TEMP/pg.log" -w start
+          "$PGBIN/psql" -h 127.0.0.1 -p 25432 -U postgres -At -c "select version()"
+          echo "url=postgres://postgres@127.0.0.1:25432" >> "$GITHUB_OUTPUT"
+      - name: "Migrate walk: SQLite"
+        if: ${{ !cancelled() }}
+        env:
+          E2E_NODE: "1"
+        run: PATH="$HOME/.local/bin:$PATH" bash reylo-e2e/e2e.sh sqlite "$RUNNER_TEMP/e2e-sqlite"
+      - name: "Migrate walk: Postgres"
+        if: ${{ !cancelled() && steps.pg.outputs.url != '' }}
+        env:
+          E2E_NODE: "1"
+          E2E_SERVER: ${{ steps.pg.outputs.url }}
+        run: PATH="$HOME/.local/bin:$PATH" bash reylo-e2e/e2e.sh postgres "$RUNNER_TEMP/e2e-postgres"
