@@ -80,7 +80,8 @@ jobs:
       - name: "Channel: Docker image"
         if: ${{ !cancelled() }}
         run: |
-          printf '#!/bin/sh\nexec docker run --rm --network host --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work ghcr.io/reylosql/reylo:%s "$@"\n' "$REYLO_VERSION" > "$RUNNER_TEMP/docker-reylo" && chmod +x "$RUNNER_TEMP/docker-reylo"
+          docker pull -q "ghcr.io/reylosql/reylo:$REYLO_VERSION"
+          printf '#!/bin/sh\nexec docker run --rm --network host -e CI --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work ghcr.io/reylosql/reylo:%s "$@"\n' "$REYLO_VERSION" > "$RUNNER_TEMP/docker-reylo" && chmod +x "$RUNNER_TEMP/docker-reylo"
           env -u CI bash reylo-e2e/smoke.sh docker "$RUNNER_TEMP/docker-reylo"
       - name: "Migrate walk: SQLite"
         if: ${{ !cancelled() }}
@@ -126,11 +127,11 @@ jobs:
             exit $status
           '
       # Older and smaller distributions: install.sh alone.
-      - name: "install.sh on Debian 11, AlmaLinux 8 and Amazon Linux 2023"
+      - name: "install.sh on Debian 12, AlmaLinux 8 and Amazon Linux 2023"
         if: ${{ !cancelled() }}
         run: |
           status=0
-          for image in debian:11 almalinux:8 amazonlinux:2023; do
+          for image in debian:12 almalinux:8 amazonlinux:2023; do
             echo "== $image"
             docker run --rm -e REYLO_VERSION -v "$GITHUB_WORKSPACE:/src:ro" "$image" bash -c '
               set -e
@@ -284,3 +285,76 @@ jobs:
           E2E_NODE: "1"
           E2E_SERVER: ${{ steps.pg.outputs.url }}
         run: env -u CI PATH="$HOME/.local/bin:$PATH" bash reylo-e2e/e2e.sh postgres "$RUNNER_TEMP/e2e-postgres"
+
+  rust:
+    name: rust (linux x64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s --health-retries 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust stable
+        run: rustup update stable && rustup default stable && rustc --version
+      - name: "Channel: cargo binstall reylo-cli"
+        run: |
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          cargo binstall -y "reylo-cli@$REYLO_VERSION"
+          command -v reylo
+          env -u CI bash reylo-e2e/smoke.sh cargo-binstall "$(command -v reylo)"
+      - name: A Rust app whose migrations run through reylo::migrate!()
+        env:
+          PROD_URL: postgres://postgres@127.0.0.1:5432/rs_prod
+        run: |
+          set -euxo pipefail
+          reylo run --url postgres://postgres@127.0.0.1:5432/postgres "create database rs_dev" "create database rs_prod"
+          cargo new -q "$RUNNER_TEMP/pinrs" && cd "$RUNNER_TEMP/pinrs"
+          cat >> Cargo.toml <<TOML
+          reylo = { version = "$REYLO_VERSION", features = ["chrono"] }
+          sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "chrono"] }
+          tokio = { version = "1", features = ["full"] }
+          TOML
+          echo "DATABASE_URL=postgres://postgres@127.0.0.1:5432/rs_dev" > .env
+          env -u CI reylo migrate init
+          printf 'create table users (\n  id bigint generated always as identity primary key,\n  email text not null unique,\n  created_at timestamptz not null default now()\n);\n' > reylo/schema.sql
+          env -u CI reylo migrate new users
+          env -u CI reylo migrate dev
+          cat > src/main.rs <<'RS'
+          #[reylo::query("insert into users (email) values (:email) returning id, email, created_at")]
+          pub mod add_user {}
+
+          #[reylo::query("select id, email from users where email = :email")]
+          pub mod find_user {}
+
+          #[tokio::main]
+          async fn main() -> Result<(), Box<dyn std::error::Error>> {
+              let pool = sqlx::PgPool::connect(&std::env::var("PROD_URL")?).await?;
+              let ran = reylo::migrate!().run(&pool).await?;
+              println!("ran: {ran:?}");
+              let status = reylo::migrate!().status(&pool).await?;
+              println!("current: {}", status.is_current());
+              let user = add_user::Query { email: "ada@example.com".into() }.run(&pool).await?;
+              println!("added {} {} {}", user.id, user.email, user.created_at);
+              let found = find_user::Query { email: "ada@example.com".into() }.run(&pool).await?;
+              println!("found {found:?}");
+              Ok(())
+          }
+          RS
+          sed -i 's/^          //' src/main.rs
+          time cargo build -q
+          cargo run -q
+          echo "== again: nothing to run"
+          cargo run -q
+          echo "== a new migration, compiled in"
+          printf '\ncreate table posts (id bigint generated always as identity primary key, user_id bigint not null references users (id), title text not null);\n' >> reylo/schema.sql
+          env -u CI reylo migrate new posts
+          env -u CI reylo migrate dev
+          cargo run -q
