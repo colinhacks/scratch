@@ -341,9 +341,10 @@ jobs:
               println!("ran: {ran:?}");
               let status = reylo::migrate!().status(&pool).await?;
               println!("current: {}", status.is_current());
-              let user = add_user::Query { email: "ada@example.com".into() }.run(&pool).await?;
+              let email = format!("ada{}@example.com", std::process::id());
+              let user = add_user::Query { email: email.clone() }.run(&pool).await?;
               println!("added {} {} {}", user.id, user.email, user.created_at);
-              let found = find_user::Query { email: "ada@example.com".into() }.run(&pool).await?;
+              let found = find_user::Query { email }.run(&pool).await?;
               println!("found {found:?}");
               Ok(())
           }
