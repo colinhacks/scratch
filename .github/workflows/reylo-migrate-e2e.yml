@@ -107,6 +107,21 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/docker-bin" && cp "$RUNNER_TEMP/docker-reylo" "$RUNNER_TEMP/docker-bin/reylo"
           env -u CI PATH="$RUNNER_TEMP/docker-bin:$PATH" bash reylo-e2e/e2e.sh postgres "$RUNNER_TEMP/e2e-docker"
+      # libSQL (Turso's server): the SQLite walk's migrations deployed to it over libsql://.
+      - name: "Migrate on a libSQL server"
+        if: ${{ !cancelled() }}
+        run: |
+          docker run -d --name sqld -p 8080:8080 ghcr.io/tursodatabase/libsql-server:latest
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/health > /dev/null && break; sleep 1; done
+          cd "$RUNNER_TEMP/e2e-sqlite"
+          export PATH="$HOME/.local/bin:$PATH"
+          url="libsql://127.0.0.1:8080?tls=0"
+          reylo migrate deploy --url "$url"
+          reylo migrate status --url "$url"
+          reylo run --url "$url" "create index users_by_name on users (name)"
+          if reylo migrate deploy --url "$url"; then echo "FAIL: deploy took a hand-changed libSQL database"; exit 1; fi
+          reylo db introspect --url "$url" | grep -q "create table users"
+          echo "PASS libSQL: deploy, status, drift refusal, introspect"
       # musl: Alpine, with install.sh through busybox wget (the image has no curl).
       - name: "Alpine (musl): install.sh through wget, npm, and the walk on all three"
         if: ${{ !cancelled() }}
@@ -210,6 +225,21 @@ jobs:
           E2E_NODE: "1"
           E2E_SERVER: postgres://postgres@127.0.0.1:5432
         run: env -u CI PATH="$HOME/.local/bin:$PATH" bash reylo-e2e/e2e.sh postgres "$RUNNER_TEMP/e2e-postgres"
+      - name: Start MySQL 8.4
+        if: ${{ !cancelled() }}
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install mysql@8.4 > /dev/null
+          bin="$(brew --prefix mysql@8.4)/bin" d="$RUNNER_TEMP/mysql"
+          mkdir -p "$d"
+          "$bin/mysqld" --no-defaults --initialize-insecure --datadir="$d/data" --user="$USER"
+          "$bin/mysqld" --no-defaults --daemonize --datadir="$d/data" --socket="$d/sock" --port=3306 --bind-address=127.0.0.1 --mysqlx=OFF --pid-file="$d/pid" --log-error="$d/err.log" --user="$USER"
+          "$bin/mysql" -uroot -h127.0.0.1 -P3306 -e "select version()"
+      - name: "Migrate walk: MySQL 8.4"
+        if: ${{ !cancelled() }}
+        env:
+          E2E_NODE: "1"
+          E2E_SERVER: mysql://root@127.0.0.1:3306
+        run: env -u CI PATH="$HOME/.local/bin:$PATH" bash reylo-e2e/e2e.sh mysql "$RUNNER_TEMP/e2e-mysql"
 
   windows:
     name: windows ${{ matrix.cpu }}
@@ -265,6 +295,17 @@ jobs:
         run: |
           npm install --global "reylo@$REYLO_VERSION"
           env -u CI bash reylo-e2e/smoke.sh npm "$(cygpath -u "$(npm prefix --global)")/reylo"
+      # windows-11-arm carries no Postgres: install EDB's build (x64, emulated) through Chocolatey.
+      - name: Install Postgres where the runner has none
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          if ($env:PGBIN -and (Test-Path "$env:PGBIN\initdb.exe")) { "PGBIN=$env:PGBIN"; exit 0 }
+          choco install postgresql17 -y --no-progress --params '/Password:postgres /Port:5433'
+          $bin = (Get-ChildItem "C:\Program Files\PostgreSQL\*\bin\initdb.exe" | Select-Object -First 1).DirectoryName
+          if (-not $bin) { throw "no Postgres after choco" }
+          Stop-Service postgresql* -ErrorAction SilentlyContinue
+          "PGBIN=$bin" >> $env:GITHUB_ENV
       - name: Start Postgres
         id: pg
         if: ${{ !cancelled() }}
@@ -285,18 +326,90 @@ jobs:
           E2E_NODE: "1"
           E2E_SERVER: ${{ steps.pg.outputs.url }}
         run: env -u CI PATH="$HOME/.local/bin:$PATH" bash reylo-e2e/e2e.sh postgres "$RUNNER_TEMP/e2e-postgres"
+      # The runner's MySQL where it has one, else Chocolatey's; as a Windows service, since the
+      # runner stops every process a step started when the step ends.
+      - name: Start MySQL
+        id: mysql
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $bin = (Get-ChildItem "C:\Program Files\MySQL\*\bin\mysqld.exe" -ErrorAction SilentlyContinue | Select-Object -First 1).DirectoryName
+          if (-not $bin) {
+            choco install mysql -y --no-progress
+            $bin = (Get-ChildItem "C:\tools\mysql\*\bin\mysqld.exe", "C:\tools\mysql\current\bin\mysqld.exe", "C:\Program Files\MySQL\*\bin\mysqld.exe" -ErrorAction SilentlyContinue | Select-Object -First 1).DirectoryName
+          }
+          if (-not $bin) { throw "no MySQL server on this runner, nor from choco" }
+          & "$bin\mysqld.exe" --version
+          $data = "$env:RUNNER_TEMP\mysql".Replace("\", "/")
+          $ini = "$env:RUNNER_TEMP\e2e-mysql.ini"
+          Set-Content $ini "[mysqld]`ndatadir=$data`nport=23306`nbind-address=127.0.0.1`nmysqlx=OFF`nlog-error=$data.log"
+          & "$bin\mysqld.exe" "--defaults-file=$ini" --initialize-insecure
+          & "$bin\mysqld.exe" --install E2EMySQL "--defaults-file=$ini"
+          Start-Service E2EMySQL
+          for ($i = 0; $i -lt 60; $i++) { & "$bin\mysqladmin.exe" --user=root --host=127.0.0.1 --port=23306 ping 2>$null; if ($LASTEXITCODE -eq 0) { break }; Start-Sleep 1 }
+          & "$bin\mysql.exe" --user=root --host=127.0.0.1 --port=23306 -e "select version()"
+          "url=mysql://root@127.0.0.1:23306" >> $env:GITHUB_OUTPUT
+      - name: "Migrate walk: MySQL"
+        if: ${{ !cancelled() && steps.mysql.outputs.url != '' }}
+        env:
+          E2E_NODE: "1"
+          E2E_SERVER: ${{ steps.mysql.outputs.url }}
+        run: env -u CI PATH="$HOME/.local/bin:$PATH" bash reylo-e2e/e2e.sh mysql "$RUNNER_TEMP/e2e-mysql"
+
+  # Each Postgres and MySQL version the docs claim, beyond the 18 and 8.4 the jobs above run.
+  versions:
+    name: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["postgres:14", "postgres:15", "postgres:16", "postgres:17", "postgres:19", "mysql:8.0.38", "mysql:9.7"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Start ${{ matrix.image }}
+        id: db
+        run: |
+          image="${{ matrix.image }}"
+          case "$image" in
+            postgres:*)
+              docker run -d --name db -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust "$image"
+              for i in $(seq 1 60); do docker exec db pg_isready -U postgres > /dev/null 2>&1 && break; sleep 1; done
+              docker exec db psql -U postgres -Atc "select version()"
+              echo "dialect=postgres" >> "$GITHUB_OUTPUT"; echo "url=postgres://postgres@127.0.0.1:5432" >> "$GITHUB_OUTPUT" ;;
+            mysql:*)
+              docker run -d --name db -p 3306:3306 -e MYSQL_ALLOW_EMPTY_PASSWORD=yes "$image"
+              for i in $(seq 1 120); do docker exec db mysql -uroot -h127.0.0.1 -e "select 1" > /dev/null 2>&1 && break; sleep 1; done
+              docker exec db mysql -uroot -h127.0.0.1 -e "select version(), @@gtid_mode"
+              echo "dialect=mysql" >> "$GITHUB_OUTPUT"; echo "url=mysql://root@127.0.0.1:3306" >> "$GITHUB_OUTPUT" ;;
+          esac
+          curl -fsSL https://reylo.dev/install.sh | sh
+          command -v pg_dump && pg_dump --version || true
+      - name: Migrate walk
+        env:
+          E2E_NODE: "1"
+          E2E_SERVER: ${{ steps.db.outputs.url }}
+        run: env -u CI PATH="$HOME/.local/bin:$PATH" bash reylo-e2e/e2e.sh "${{ steps.db.outputs.dialect }}" "$RUNNER_TEMP/e2e"
 
   rust:
-    name: rust (linux x64)
-    runs-on: ubuntu-latest
-    timeout-minutes: 50
-    services:
-      postgres:
-        image: postgres:18
-        env:
-          POSTGRES_HOST_AUTH_METHOD: trust
-        ports: ["5432:5432"]
-        options: --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s --health-retries 30
+    name: rust ${{ matrix.os }} ${{ matrix.dialect }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, runner: ubuntu-latest, dialect: postgres }
+          - { os: linux, runner: ubuntu-latest, dialect: mysql }
+          - { os: linux, runner: ubuntu-latest, dialect: sqlite }
+          - { os: macos, runner: macos-15, dialect: sqlite }
+          - { os: windows, runner: windows-latest, dialect: sqlite }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -304,58 +417,34 @@ jobs:
       - uses: actions/checkout@v4
       - name: Rust stable
         run: rustup update stable && rustup default stable && rustc --version
-      - name: "Channel: cargo binstall reylo-cli"
+      - name: "Channel: cargo binstall reylo-cli (unix)"
+        if: ${{ matrix.os != 'windows' }}
         run: |
           curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
           cargo binstall -y "reylo-cli@$REYLO_VERSION"
-          command -v reylo
-          env -u CI bash reylo-e2e/smoke.sh cargo-binstall "$(command -v reylo)"
+      - name: "Channel: cargo binstall reylo-cli (windows)"
+        if: ${{ matrix.os == 'windows' }}
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy Unrestricted -Scope Process
+          iex (iwr "https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.ps1").Content
+          cargo binstall -y "reylo-cli@$env:REYLO_VERSION"
+      - name: "Channel: cargo binstall, checked"
+        run: env -u CI bash reylo-e2e/smoke.sh cargo-binstall "$(command -v reylo)"
+      - name: Start the server
+        id: db
+        run: |
+          case "${{ matrix.dialect }}" in
+            postgres)
+              docker run -d --name db -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:18
+              for i in $(seq 1 60); do docker exec db pg_isready -U postgres > /dev/null 2>&1 && break; sleep 1; done
+              echo "url=postgres://postgres@127.0.0.1:5432" >> "$GITHUB_OUTPUT" ;;
+            mysql)
+              docker run -d --name db -p 3306:3306 -e MYSQL_ALLOW_EMPTY_PASSWORD=yes mysql:8.4
+              for i in $(seq 1 120); do docker exec db mysql -uroot -h127.0.0.1 -e "select 1" > /dev/null 2>&1 && break; sleep 1; done
+              echo "url=mysql://root@127.0.0.1:3306" >> "$GITHUB_OUTPUT" ;;
+          esac
       - name: A Rust app whose migrations run through reylo::migrate!()
         env:
-          PROD_URL: postgres://postgres@127.0.0.1:5432/rs_prod
-        run: |
-          set -euxo pipefail
-          reylo run --url postgres://postgres@127.0.0.1:5432/postgres "create database rs_dev" "create database rs_prod"
-          cargo new -q "$RUNNER_TEMP/pinrs" && cd "$RUNNER_TEMP/pinrs"
-          cat >> Cargo.toml <<TOML
-          reylo = { version = "$REYLO_VERSION", features = ["chrono"] }
-          sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "chrono"] }
-          tokio = { version = "1", features = ["full"] }
-          TOML
-          echo "DATABASE_URL=postgres://postgres@127.0.0.1:5432/rs_dev" > .env
-          env -u CI reylo migrate init
-          printf 'create table users (\n  id bigint generated always as identity primary key,\n  email text not null unique,\n  created_at timestamptz not null default now()\n);\n' > reylo/schema.sql
-          env -u CI reylo migrate new users
-          env -u CI reylo migrate dev
-          cat > src/main.rs <<'RS'
-          #[reylo::query("insert into users (email) values (:email) returning id, email, created_at")]
-          pub mod add_user {}
-
-          #[reylo::query("select id, email from users where email = :email")]
-          pub mod find_user {}
-
-          #[tokio::main]
-          async fn main() -> Result<(), Box<dyn std::error::Error>> {
-              let pool = sqlx::PgPool::connect(&std::env::var("PROD_URL")?).await?;
-              let ran = reylo::migrate!().run(&pool).await?;
-              println!("ran: {ran:?}");
-              let status = reylo::migrate!().status(&pool).await?;
-              println!("current: {}", status.is_current());
-              let email = format!("ada{}@example.com", std::process::id());
-              let user = add_user::Query { email: &email }.run(&pool).await?;
-              println!("added {} {} {}", user.id, user.email, user.created_at);
-              let found = find_user::Query { email: &email }.run(&pool).await?;
-              println!("found {found:?}");
-              Ok(())
-          }
-          RS
-          sed -i 's/^          //' src/main.rs
-          time cargo build -q
-          cargo run -q
-          echo "== again: nothing to run"
-          cargo run -q
-          echo "== a new migration, compiled in"
-          printf '\ncreate table posts (id bigint generated always as identity primary key, user_id bigint not null references users (id), title text not null);\n' >> reylo/schema.sql
-          env -u CI reylo migrate new posts
-          env -u CI reylo migrate dev
-          cargo run -q
+          E2E_SERVER: ${{ steps.db.outputs.url }}
+        run: env -u CI bash reylo-e2e/rust.sh "${{ matrix.dialect }}" "$RUNNER_TEMP/rs-app"
